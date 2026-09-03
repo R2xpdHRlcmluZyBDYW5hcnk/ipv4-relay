@@ -1,0 +1,17 @@
+{
+  "global": {
+    "log_level": 5,
+    "stale_client_sweep_interval_seconds": 300
+  },
+  "interfaces": {
+    "lan": {
+      "ifname": "eth1",
+      "arpproxy_routing": true
+    },
+    "wan": {
+      "ifname": "eth0",
+      "master": true,
+      "arpproxy_routing": true
+    }
+  }
+}
