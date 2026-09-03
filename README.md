@@ -75,4 +75,4 @@ internal/relay/    引擎、配置、netlink 监控、DHCPv4/ARP 中继实现
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。
+[MIT](LICENSE)
