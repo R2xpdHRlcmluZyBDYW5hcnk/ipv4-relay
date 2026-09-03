@@ -70,7 +70,7 @@ jobs:
           printf 'echo "Edit /etc/ipv4-relay/config.json, then run: systemctl enable --now ipv4-relay"\n'
           } > "$PKG/DEBIAN/postinst"
           chmod 755 "$PKG/DEBIAN/postinst"
-          dpkg-deb --build "$PKG"
+          dpkg-deb --build --root-owner-group "$PKG"
           mv "${PKG}.deb" "ipv4-relay_${VERSION}_linux_${ARCH}.deb"
 
       - name: Build generic tarball
