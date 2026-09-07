@@ -43,7 +43,7 @@ type Interface struct {
 	DHCPv4 Mode
 	ARP    Mode
 
-	dhcp *dhcpSock
+	dhcp []*dhcpSock
 }
 
 // interfaces holds every configured interface keyed by its config name.

@@ -77,26 +77,11 @@ type dhcpSock struct {
 	done  chan struct{}
 }
 
-// dhcpv4Setup opens (or tears down) a UDP/67 socket bound to the given
-// interface. Slave sockets receive client broadcasts; master sockets receive
-// the server replies (unicast to the giaddr we stamped, or broadcast).
-func dhcpv4Setup(iface *Interface, enable bool) error {
-	enable = enable && iface.DHCPv4 != ModeDisabled
-
-	if iface.dhcp != nil {
-		close(iface.dhcp.done)
-		closeFD(iface.dhcp.fd)
-		iface.dhcp = nil
-	}
-
-	if !enable {
-		return nil
-	}
-
+func openDHCPSocket(iface *Interface, port int) (*dhcpSock, error) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
 	if err != nil {
-		Errorf("socket(AF_INET) for dhcpv4 relay on %s: %v", iface.Ifname, err)
-		return err
+		Errorf("socket(AF_INET) for dhcpv4 relay on %s:%d: %v", iface.Ifname, port, err)
+		return nil, err
 	}
 
 	ok := false
@@ -108,27 +93,65 @@ func dhcpv4Setup(iface *Interface, enable bool) error {
 
 	if err := bindToDevice(fd, iface.Ifname); err != nil {
 		Errorf("SO_BINDTODEVICE(%s): %v", iface.Ifname, err)
-		return err
+		return nil, err
 	}
 	if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 		Errorf("SO_REUSEADDR: %v", err)
-		return err
+		return nil, err
+	}
+	if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		Errorf("SO_REUSEPORT: %v", err)
+		return nil, err
 	}
 	if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1); err != nil {
 		Errorf("SO_BROADCAST: %v", err)
-		return err
+		return nil, err
 	}
 
-	if err := unix.Bind(fd, &unix.SockaddrInet4{Port: dhcpv4ServerPort}); err != nil {
-		Errorf("bind(:%d) on %s: %v", dhcpv4ServerPort, iface.Ifname, err)
-		return err
+	if err := unix.Bind(fd, &unix.SockaddrInet4{Port: port}); err != nil {
+		Errorf("bind(:%d) on %s: %v", port, iface.Ifname, err)
+		return nil, err
 	}
 
 	ds := &dhcpSock{fd: fd, iface: iface, done: make(chan struct{})}
-	iface.dhcp = ds
 	ok = true
-
 	go dhcpReadLoop(ds)
+	return ds, nil
+}
+
+// dhcpv4Setup opens (or tears down) UDP sockets bound to the given
+// interface. Slave sockets receive client broadcasts (port 67); master sockets
+// receive server replies (port 67 for RFC 2131 unicast/broadcast, port 68 for
+// non-compliant upstream servers like ISP modems broadcasting replies to the client port).
+func dhcpv4Setup(iface *Interface, enable bool) error {
+	enable = enable && iface.DHCPv4 != ModeDisabled
+
+	if len(iface.dhcp) > 0 {
+		for _, ds := range iface.dhcp {
+			close(ds.done)
+			closeFD(ds.fd)
+		}
+		iface.dhcp = nil
+	}
+
+	if !enable {
+		return nil
+	}
+
+	ds67, err := openDHCPSocket(iface, dhcpv4ServerPort)
+	if err != nil {
+		return err
+	}
+	iface.dhcp = append(iface.dhcp, ds67)
+
+	if iface.Master {
+		ds68, err := openDHCPSocket(iface, dhcpv4ClientPort)
+		if err != nil {
+			Warnf("Failed to bind port 68 on master %s (broadcast server replies may be missed): %v", iface.Ifname, err)
+		} else {
+			iface.dhcp = append(iface.dhcp, ds68)
+		}
+	}
 
 	return nil
 }
@@ -172,13 +195,22 @@ func dhcpReadLoop(ds *dhcpSock) {
 	}
 }
 
+func ifaceHasDHCPSock(iface *Interface, ds *dhcpSock) bool {
+	for _, s := range iface.dhcp {
+		if s == ds {
+			return true
+		}
+	}
+	return false
+}
+
 // handleDHCPv4 processes incoming DHCPv4 packets: BOOTREQUESTs are only ever
 // relayed when they arrive on a slave interface (a BOOTREQUEST seen on a
 // master is some other network's client - or our own relayed broadcast
 // looping back - and is never ours to relay), BOOTREPLYs only on masters.
 func handleDHCPv4(ds *dhcpSock, src netip.Addr, data []byte) {
 	iface := ds.iface
-	if iface.dhcp != ds || iface.DHCPv4 != ModeRelay {
+	if !ifaceHasDHCPSock(iface, ds) || iface.DHCPv4 != ModeRelay {
 		return
 	}
 
@@ -388,7 +420,7 @@ func relayClientRequest(data []byte, iface *Interface) {
 	}
 
 	for _, c := range interfaces {
-		if !c.Master || c.DHCPv4 != ModeRelay || c.dhcp == nil {
+		if !c.Master || c.DHCPv4 != ModeRelay || len(c.dhcp) == 0 {
 			continue
 		}
 
@@ -454,7 +486,7 @@ func relayServerResponse(src netip.Addr, data []byte, master *Interface) {
 		targets = append(targets, slave)
 	} else {
 		for _, i := range interfaces {
-			if !i.Master && i.DHCPv4 == ModeRelay && i.dhcp != nil {
+			if !i.Master && i.DHCPv4 == ModeRelay && len(i.dhcp) > 0 {
 				targets = append(targets, i)
 			}
 		}
@@ -505,11 +537,11 @@ func unmirrorClient(addr netip.Addr, iface *Interface) {
 
 // sendDHCPv4 sends payload out iface's DHCPv4 socket toward dest:port.
 func sendDHCPv4(iface *Interface, dest netip.Addr, port int, payload []byte) {
-	if iface.dhcp == nil {
+	if len(iface.dhcp) == 0 {
 		return
 	}
 
-	if err := unix.Sendto(iface.dhcp.fd, payload, 0, sockaddrIn4(dest, port)); err != nil {
+	if err := unix.Sendto(iface.dhcp[0].fd, payload, 0, sockaddrIn4(dest, port)); err != nil {
 		Errorf("Failed to send DHCPv4 to %s@%s: %v", dest, iface.Ifname, err)
 	} else {
 		Debugf("Sent %d bytes DHCPv4 to %s:%d@%s", len(payload), dest, port, iface.Ifname)
