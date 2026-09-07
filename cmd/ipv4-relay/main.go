@@ -93,7 +93,7 @@ func main() {
 	// setsockopt failures are already reported by their call sites, so we
 	// only warn here instead of hard-failing on non-root uid.
 	if u, err := user.Current(); err != nil || u.Uid != "0" {
-		relay.Errorf("Not running as root - relying on CAP_NET_RAW/CAP_NET_ADMIN/CAP_NET_BIND_SERVICE")
+		relay.Warnf("Not running as root - relying on CAP_NET_RAW/CAP_NET_ADMIN/CAP_NET_BIND_SERVICE")
 	}
 
 	if *configFile == "" {

@@ -502,7 +502,7 @@ func relayServerResponse(src netip.Addr, data []byte, master *Interface) {
 		if msgType == dhcpMsgAck && hasYi {
 			var mac [6]byte
 			copy(mac[:], data[28:34])
-			Noticef("DHCPv4-ack: %s assigned to %02x:%02x:%02x:%02x:%02x:%02x on %s",
+			Infof("DHCPv4-ack: %s assigned to %02x:%02x:%02x:%02x:%02x:%02x on %s",
 				yiaddr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], t.Name)
 			key := mirroredNeighKey{addr: yiaddr, ifindex: t.Ifindex}
 			if !mirroredNeighs[key] {
@@ -530,7 +530,7 @@ func unmirrorClient(addr netip.Addr, iface *Interface) {
 		return
 	}
 	delete(mirroredNeighs, key)
-	Noticef("Client on %s gave up %s, removing mirror", iface.Name, addr)
+	Infof("Client on %s gave up %s, removing mirror", iface.Name, addr)
 	arpMirrorAddr(addr, iface, false)
 	deleteNeigh4(addr, iface.Ifindex)
 }
