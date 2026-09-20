@@ -14,6 +14,10 @@ import (
 // bytes, followed by the 4-byte magic cookie and the options area.
 const (
 	bootpFixedLen  = 236
+	bootpSnameOff  = 44
+	bootpSnameLen  = 64
+	bootpFileOff   = 108
+	bootpFileLen   = 128
 	dhcpCookieOff  = 236
 	dhcpOptionsOff = 240
 
@@ -31,6 +35,7 @@ const (
 	dhcpOptPad       = 0
 	dhcpOptEnd       = 255
 	dhcpOptMsgType   = 53
+	dhcpOptOverload  = 52 // RFC 2132 section 9.3, sname/file option overloading
 	dhcpOptRequested = 50
 	dhcpOptAgentInfo = 82 // RFC 3046 relay agent information
 
@@ -242,17 +247,55 @@ type dhcpOption struct {
 	data []byte
 }
 
-// parseDHCPOptions walks the options area (starting at dhcpOptionsOff),
-// tolerating pad bytes. Returns nil if the area is malformed or unterminated.
+// parseDHCPOptions collects the packet's DHCP options, honoring option
+// overloading (RFC 2132 section 9.3): when the main options area carries
+// option 52, the sname/file header fields hold additional option areas that
+// are parsed after the main area, file first then sname (the order common
+// client implementations use). The main area is parsed strictly - a malformed
+// or unterminated one means the packet is not DHCP. A header field claimed to
+// be overloaded that fails to parse is skipped instead of invalidating the
+// packet: the main area is already well-formed and the overload hint may
+// simply be wrong.
 func parseDHCPOptions(data []byte) []dhcpOption {
+	out := parseOptionArea(data[dhcpOptionsOff:])
+	if out == nil {
+		return nil
+	}
+
+	ov, ok := dhcpOptionByte(out, dhcpOptOverload)
+	if !ok {
+		return out
+	}
+
+	appendField := func(off, size int) {
+		if area := parseOptionArea(data[off : off+size]); area != nil {
+			out = append(out, area...)
+		}
+	}
+	switch ov {
+	case 1: // file holds options
+		appendField(bootpFileOff, bootpFileLen)
+	case 2: // sname holds options
+		appendField(bootpSnameOff, bootpSnameLen)
+	case 3: // both, file first
+		appendField(bootpFileOff, bootpFileLen)
+		appendField(bootpSnameOff, bootpSnameLen)
+	}
+	return out
+}
+
+// parseOptionArea walks one options area (the main options area or an
+// overloaded header field), tolerating pad bytes. Returns nil if the area is
+// malformed or runs off the end without an End option.
+func parseOptionArea(area []byte) []dhcpOption {
 	var out []dhcpOption
 
-	off := dhcpOptionsOff
+	off := 0
 	for {
-		if off >= len(data) {
+		if off >= len(area) {
 			return nil // ran off the end without an End option
 		}
-		code := data[off]
+		code := area[off]
 		if code == dhcpOptEnd {
 			return out
 		}
@@ -260,14 +303,14 @@ func parseDHCPOptions(data []byte) []dhcpOption {
 			off++
 			continue
 		}
-		if off+2 > len(data) {
+		if off+2 > len(area) {
 			return nil
 		}
-		l := int(data[off+1])
-		if off+2+l > len(data) {
+		l := int(area[off+1])
+		if off+2+l > len(area) {
 			return nil
 		}
-		out = append(out, dhcpOption{code: code, data: data[off+2 : off+2+l]})
+		out = append(out, dhcpOption{code: code, data: area[off+2 : off+2+l]})
 		off += 2 + l
 	}
 }
@@ -347,7 +390,10 @@ func insertAgentInfo(data []byte, ifindex int) ([]byte, bool) {
 
 // stripAgentInfo returns a copy of the server reply with every option 82
 // removed (clients never asked for it and some choke on it), preserving the
-// End option and any trailing padding.
+// End option and any trailing padding. Only the main options area is scanned:
+// a server echoing option 82 into an overloaded sname/file field does not
+// happen in practice, and rewriting fixed-size header fields is not worth the
+// byte surgery.
 func stripAgentInfo(data []byte) []byte {
 	if len(data) < dhcpOptionsOff {
 		return data
@@ -419,6 +465,15 @@ func relayClientRequest(data []byte, iface *Interface) {
 		}
 	}
 
+	// Option 82 return routing is an optimization, not a prerequisite: if it
+	// cannot be inserted (packet too large to append it safely, malformed
+	// options area), relay the packet unmodified and let replies fall back to
+	// being broadcast on every slave - that beats not relaying at all.
+	out82, have82 := insertAgentInfo(data, iface.Ifindex)
+	if !have82 {
+		Warnf("Cannot insert option 82 into DHCPv4 packet on %s, relaying without it", iface.Name)
+	}
+
 	for _, c := range interfaces {
 		if !c.Master || c.DHCPv4 != ModeRelay || len(c.dhcp) == 0 {
 			continue
@@ -430,10 +485,9 @@ func relayClientRequest(data []byte, iface *Interface) {
 			continue
 		}
 
-		out, ok := insertAgentInfo(data, iface.Ifindex)
-		if !ok {
-			Warnf("Cannot insert option 82 into DHCPv4 packet on %s", iface.Name)
-			return
+		out := out82
+		if !have82 {
+			out = data
 		}
 
 		// Per-master copy: hops and giaddr are ours to set.
