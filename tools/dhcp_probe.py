@@ -27,6 +27,7 @@ def opt(code, payload):
 
 
 def build(msg_type, server_id=None, requested=None):
+    flags = 0x0000 if os.environ.get("PROBE_NOBCAST") else 0x8000
     opts = opt(53, bytes([msg_type]))
     if server_id:
         opts += opt(54, server_id)
@@ -46,7 +47,7 @@ def build(msg_type, server_id=None, requested=None):
             pad -= n
     opts += b"\xff"
 
-    pkt = struct.pack("!BBBBIHH", 1, 1, 6, 0, XID, 0, 0x8000)  # op..flags
+    pkt = struct.pack("!BBBBIHH", 1, 1, 6, 0, XID, 0, flags)  # op..flags
     pkt += bytes(4)          # ciaddr
     pkt += bytes(4)          # yiaddr
     pkt += bytes(4)          # siaddr
@@ -119,7 +120,8 @@ def main():
     s.setsockopt(socket.SOL_SOCKET, 25, IFACE.encode() + b"\0")  # SO_BINDTODEVICE
     s.bind(("0.0.0.0", 68))
 
-    print("probe if=%s mac=%s xid=%08x" % (IFACE, MAC.hex(":"), XID))
+    print("probe if=%s mac=%s xid=%08x%s" %
+          (IFACE, MAC.hex(":"), XID, " (broadcast flag clear)" if os.environ.get("PROBE_NOBCAST") else ""))
 
     for attempt in range(2):
         s.sendto(build(MT_DISCOVER), ("255.255.255.255", 67))

@@ -496,6 +496,16 @@ func relayClientRequest(data []byte, iface *Interface) {
 		if bytes.Equal(out[24:28], []byte{0, 0, 0, 0}) {
 			copy(out[24:28], giaddr.AsSlice()) // giaddr
 		}
+		// Force the broadcast flag on the relayed copy. Some servers (ISP
+		// modems observed in the field) silently drop relayed requests with
+		// the flag clear: instead of returning the reply via giaddr they try
+		// to deliver it to the client directly, ARP for the offered address
+		// on their own segment, get no answer and drop the reply - iOS/macOS
+		// clients habitually clear the flag and never lease through them.
+		// Clients must accept broadcast replies per RFC 2131 section 4.1, so
+		// this is safe against compliant servers; it only costs us the
+		// unicast-ACK delivery path when the server echoes the flag.
+		out[10] |= byte(bootpBroadcastFlag >> 8)
 
 		Debugf("Relaying DHCPv4-%s (giaddr %s) to broadcast on %s", dhcpMsgTypeName(msgType), giaddr, c.Name)
 		sendDHCPv4(c, broadcastAddr, dhcpv4ServerPort, out)
