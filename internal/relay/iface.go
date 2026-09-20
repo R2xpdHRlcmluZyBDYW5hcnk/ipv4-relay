@@ -88,11 +88,11 @@ func getMAC(iface *Interface) (net.HardwareAddr, error) {
 	return nif.HardwareAddr, nil
 }
 
-// relayLinkAddress4 picks the interface's primary IPv4 address, used as the
-// giaddr when relaying client requests out a master interface: the upstream
-// DHCP server selects the lease pool from the giaddr subnet and sends its
-// replies back to it. Skips tentative (DAD-in-progress) and non-unicast
-// addresses; returns false when the interface has no usable IPv4 address yet.
+// relayLinkAddress4 picks the interface's primary IPv4 address. On masters it
+// is the giaddr stamped into relayed client requests; on slaves it is the
+// gateway rewritten into server replies (see rewriteGateway in dhcpv4.go).
+// Skips tentative (DAD-in-progress) and non-unicast addresses; returns false
+// when the interface has no usable IPv4 address yet.
 func relayLinkAddress4(iface *Interface) (netip.Addr, bool) {
 	for _, a := range iface.Addr4 {
 		if a.Tentative || !a.Addr.Is4() {

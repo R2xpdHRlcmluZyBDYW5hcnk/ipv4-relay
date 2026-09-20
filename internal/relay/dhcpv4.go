@@ -34,6 +34,7 @@ const (
 
 	dhcpOptPad       = 0
 	dhcpOptEnd       = 255
+	dhcpOptRouter    = 3
 	dhcpOptMsgType   = 53
 	dhcpOptOverload  = 52 // RFC 2132 section 9.3, sname/file option overloading
 	dhcpOptRequested = 50
@@ -512,6 +513,44 @@ func relayClientRequest(data []byte, iface *Interface) {
 	}
 }
 
+// rewriteGateway patches the router option (DHCP option 3) of a server reply
+// in place, so clients behind the receiving slave interface use the relay's
+// own address on that slave as their default gateway instead of the upstream
+// router's. The data path is unchanged either way - the relay answers ARP for
+// its own address on the slave, and upstream next-hops stay reachable through
+// it via proxy-ARP; this only changes which address clients display and use
+// as their gateway. Option 3 is always 4 bytes, so this is an in-place patch
+// on the per-target payload copy stripAgentInfo produced. Returns false when
+// there is nothing to rewrite (no option 3, or an unexpected length).
+func rewriteGateway(data []byte, gw netip.Addr) bool {
+	off := dhcpOptionsOff
+	for {
+		if off >= len(data) {
+			return false
+		}
+		code := data[off]
+		if code == dhcpOptEnd {
+			return false
+		}
+		if code == dhcpOptPad {
+			off++
+			continue
+		}
+		if off+2 > len(data) {
+			return false
+		}
+		l := int(data[off+1])
+		if code == dhcpOptRouter {
+			if l != 4 || off+2+l > len(data) {
+				return false
+			}
+			copy(data[off+2:off+2+4], gw.AsSlice())
+			return true
+		}
+		off += 2 + l
+	}
+}
+
 // relayServerResponse relays a server BOOTREPLY received on a master
 // interface to the slave the circuit-id option names (falling back to all
 // slaves when the server did not echo option 82). OFFER/NAK are always
@@ -543,8 +582,6 @@ func relayServerResponse(src netip.Addr, data []byte, master *Interface) {
 		}
 	}
 
-	payload := stripAgentInfo(data)
-
 	targets := make([]*Interface, 0, 1)
 	if haveSlave {
 		targets = append(targets, slave)
@@ -563,6 +600,15 @@ func relayServerResponse(src netip.Addr, data []byte, master *Interface) {
 	flags := binary.BigEndian.Uint16(data[10:12])
 
 	for _, t := range targets {
+		// Per-target copy: option 82 is stripped, and each slave's clients
+		// get that slave's own address as their gateway (when it has one).
+		payload := stripAgentInfo(data)
+		if gw, ok := relayLinkAddress4(t); ok {
+			if rewriteGateway(payload, gw) {
+				Debugf("DHCPv4-%s gateway rewritten to %s on %s", dhcpMsgTypeName(msgType), gw, t.Name)
+			}
+		}
+
 		if msgType == dhcpMsgAck && hasYi {
 			var mac [6]byte
 			copy(mac[:], data[28:34])

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"net/netip"
 	"testing"
 )
 
@@ -194,6 +195,46 @@ func TestStripAgentInfo(t *testing.T) {
 	plain := buildDHCP(optBytes(dhcpOptMsgType, dhcpMsgNak))
 	if out := stripAgentInfo(plain); !bytes.Equal(out, plain) {
 		t.Fatal("clean packet must be returned unchanged")
+	}
+}
+
+func TestRewriteGateway(t *testing.T) {
+	gw := netip.MustParseAddr("192.168.8.1")
+
+	// Normal ACK carrying option 3: patched in place, siblings untouched.
+	pkt := buildDHCP(
+		optBytes(dhcpOptMsgType, dhcpMsgAck),
+		optBytes(dhcpOptRouter, 192, 168, 1, 1),
+		optBytes(dhcpOptRequested, 10, 0, 0, 5),
+	)
+	if !rewriteGateway(pkt, gw) {
+		t.Fatal("rewrite failed on packet with option 3")
+	}
+	off := bytes.Index(pkt, []byte{dhcpOptRouter, 4})
+	if off < 0 {
+		t.Fatal("option 3 vanished")
+	}
+	if !bytes.Equal(pkt[off+2:off+6], gw.AsSlice()) {
+		t.Fatalf("gateway not rewritten: %v", pkt[off+2:off+6])
+	}
+	opts := parseDHCPOptions(pkt)
+	if d, ok := findOpt(opts, dhcpOptRouter); !ok || !bytes.Equal(d, gw.AsSlice()) {
+		t.Fatalf("option 3 wrong after rewrite: %v", d)
+	}
+	if mt, ok := findOpt(opts, dhcpOptMsgType); !ok || mt[0] != dhcpMsgAck {
+		t.Fatal("sibling option corrupted by rewrite")
+	}
+
+	// No option 3: nothing to do.
+	plain := buildDHCP(optBytes(dhcpOptMsgType, dhcpMsgNak))
+	if rewriteGateway(plain, gw) {
+		t.Fatal("rewrite must fail without option 3")
+	}
+
+	// Option 3 with an unexpected length: refuse to patch.
+	odd := buildDHCP([]byte{dhcpOptRouter, 3})
+	if rewriteGateway(odd, gw) {
+		t.Fatal("rewrite must refuse odd-length option 3")
 	}
 }
 
