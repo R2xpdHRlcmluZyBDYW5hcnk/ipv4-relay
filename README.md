@@ -8,16 +8,18 @@
 
 - **DHCPv4 中继**（RFC 1542/2131/3046）
   - 下游接口接收客户端 DHCP 广播 -> 填 `giaddr` + 附加 Option 82 circuit-id -> 上游接口重新广播
-  - 上游服务器应答按 circuit-id 转发回对应下游接口，并剥除 Option 82
-  - 从 DHCPACK 自动学习客户端：安装 proxy-ARP 表项和 `/32` 主机路由；RELEASE/DECLINE 时立即拆除
+  - 上游应答按已转发的 DHCP 请求匹配，只发回原下游接口。服务器不回显 Option 82 时也能定位，回显时校验 circuit-id 并剥除该选项
+  - 从匹配的 DHCPACK 学习客户端，安装 proxy-ARP 表项和 `/32` 主机路由。收到已记录的租约持有者的 RELEASE/DECLINE 时清理
   - 邻居表事件 + 周期清扫兜底，客户端消失后自动回收表项
-  - 网关改写：下游接口配有 IPv4 地址时，把应答中的网关选项改写为该地址，客户端的默认网关即本机；无地址的下游自动回退为服务器原值
+  - 网关改写：下游接口地址按应答中的子网掩码可在客户端链路上直达时，将 Option 3 的首选网关改为该地址。缺少可用掩码或上游提供 Option 121 时保留服务器的网关和路由选项
 - **ARP 中继（proxy ARP）**
   - 上游对客户端地址的 ARP 询问由本机代答，下游对上游地址的 ARP 询问同样代答
-- **热重载**：`SIGHUP` 重读配置；接口增删、地址变化经 netlink 自动跟踪
+- **热重载**：`SIGHUP` 重读配置。读取、校验或绑定必需的 DHCP 端口失败时保留运行中的配置，并记录错误。接口增删、地址变化经 netlink 自动跟踪
 - **非 root 运行**：配合 systemd `DynamicUser` + `AmbientCapabilities`，仅需 `CAP_NET_RAW` / `CAP_NET_ADMIN` / `CAP_NET_BIND_SERVICE`
 
 ## 编译
+
+发布包使用 Go 1.27.3。
 
 ```sh
 go build -trimpath -ldflags="-s -w" -o ipv4-relay ./cmd/ipv4-relay
@@ -66,6 +68,16 @@ systemctl enable --now ipv4-relay
 
 - 本机自身不应再运行 DHCPv4 服务器（如 kea-dhcp4）监听相同接口，端口 67 会冲突
 - 客户端获得的是上游网段地址，若上游有 NAT/防火墙策略，需相应放行该网段
+- 下游为直连 DHCP 客户端。上游链路应由可信 DHCP 服务器提供租约，DHCP 本身不提供服务器身份认证
+
+## 回归测试
+
+在 Linux 上运行 `go test ./...`。网络回归测试需要 Python 3、iproute2、util-linux 和创建网络命名空间所需的权限。脚本在独立命名空间内创建虚拟接口并启动构建好的二进制。
+
+```sh
+go build -o /tmp/ipv4-relay ./cmd/ipv4-relay
+sudo python3 tools/test_relay_linux.py /tmp/ipv4-relay
+```
 
 ## 项目结构
 

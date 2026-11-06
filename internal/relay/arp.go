@@ -56,7 +56,7 @@ func arpSetup(iface *Interface, enable bool) error {
 // proxied ARP request at all.
 func arpMirrorAddr(addr netip.Addr, iface *Interface, add bool) {
 	for _, c := range interfaces {
-		if c.Ifindex == iface.Ifindex || !c.Master || c.ARP != ModeRelay {
+		if c.Ifindex == 0 || c.Ifindex == iface.Ifindex || !c.Master || c.ARP != ModeRelay || (add && !c.Running) {
 			continue
 		}
 		// A proxy-ARP entry is inert unless proxy_arp is enabled on its
@@ -82,6 +82,43 @@ func arpMirrorAddr(addr netip.Addr, iface *Interface, add bool) {
 	}
 }
 
+func relayRouteAddress(route netlink.Route, ifindex int) (netip.Addr, bool) {
+	if route.LinkIndex != ifindex || route.Priority != ourRouteMetric || route.Dst == nil ||
+		route.Protocol != unix.RTPROT_STATIC || route.Scope != netlink.SCOPE_LINK || route.Table != unix.RT_TABLE_MAIN {
+		return netip.Addr{}, false
+	}
+	if ones, bits := route.Dst.Mask.Size(); ones != 32 || bits != 32 {
+		return netip.Addr{}, false
+	}
+	return netip.AddrFromSlice(route.Dst.IP.To4())
+}
+
+func interfaceRouteAddresses(iface *Interface) []netip.Addr {
+	if iface.Ifindex == 0 {
+		return nil
+	}
+	routes, err := netlink.RouteListFiltered(unix.AF_INET, &netlink.Route{LinkIndex: iface.Ifindex}, netlink.RT_FILTER_OIF)
+	if err != nil {
+		Warnf("list routes on %s: %v", iface.Ifname, err)
+		return nil
+	}
+	var addrs []netip.Addr
+	for _, route := range routes {
+		if addr, ok := relayRouteAddress(route, iface.Ifindex); ok {
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs
+}
+
+func removeInterfaceRoutes(iface *Interface) {
+	for _, addr := range interfaceRouteAddresses(iface) {
+		if err := setupRoute4(addr, 32, iface.Ifindex, ourRouteMetric, false); err != nil {
+			Warnf("route %s/32 via %s: %v", addr, iface.Ifname, err)
+		}
+	}
+}
+
 // setupRoute4 adds or removes a route via netlink.
 func setupRoute4(addr netip.Addr, prefixlen int, ifindex int, metric int, add bool) error {
 	dst := &net.IPNet{IP: net.IP(addr.AsSlice()), Mask: net.CIDRMask(prefixlen, 32)}
@@ -92,10 +129,10 @@ func setupRoute4(addr netip.Addr, prefixlen int, ifindex int, metric int, add bo
 		Priority:  metric,
 		Table:     unix.RT_TABLE_MAIN,
 		Scope:     netlink.SCOPE_LINK,
+		Protocol:  unix.RTPROT_STATIC,
 	}
 
 	if add {
-		route.Protocol = unix.RTPROT_STATIC
 		return netlink.RouteReplace(route)
 	}
 

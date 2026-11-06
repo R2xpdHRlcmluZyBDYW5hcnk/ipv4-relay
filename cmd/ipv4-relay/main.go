@@ -23,7 +23,7 @@ func ipv4Enabled() bool {
 	return true
 }
 
-const version = "v0.1.2"
+const version = "v0.1.3"
 
 func printUsage(app string, exitCode int) {
 	fmt.Fprintf(os.Stderr, "== %s Usage ==\n"+
@@ -115,6 +115,10 @@ func main() {
 		relay.Errorf("Unable to start netlink monitor: %v", err)
 		os.Exit(4)
 	}
+	if err := relay.Reload(); err != nil {
+		relay.Errorf("Unable to load relay configuration: %v", err)
+		os.Exit(2)
+	}
 
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
@@ -122,7 +126,11 @@ func main() {
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
-				relay.Eng.Post(relay.Reload)
+				relay.Eng.Post(func() {
+					if err := relay.Reload(); err != nil {
+						relay.Errorf("Unable to reload relay configuration: %v", err)
+					}
+				})
 			case syscall.SIGINT, syscall.SIGTERM:
 				close(done)
 				os.Exit(0)
@@ -130,6 +138,5 @@ func main() {
 		}
 	}()
 
-	relay.Eng.Post(relay.Reload)
 	relay.Eng.Run()
 }

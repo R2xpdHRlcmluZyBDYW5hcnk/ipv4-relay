@@ -36,7 +36,6 @@ type Interface struct {
 	Master  bool
 
 	LearnRoutes bool // install /32 host routes for mirrored neighbors
-	Inuse       bool
 
 	Addr4 []IPAddr
 

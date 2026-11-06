@@ -2,9 +2,13 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -34,11 +38,15 @@ const (
 
 	dhcpOptPad       = 0
 	dhcpOptEnd       = 255
+	dhcpOptMask      = 1
 	dhcpOptRouter    = 3
 	dhcpOptMsgType   = 53
 	dhcpOptOverload  = 52 // RFC 2132 section 9.3, sname/file option overloading
 	dhcpOptRequested = 50
+	dhcpOptServerID  = 54
+	dhcpOptClientID  = 61
 	dhcpOptAgentInfo = 82 // RFC 3046 relay agent information
+	dhcpOptRoutes    = 121
 
 	agentSubOptCircuitID = 1
 
@@ -52,7 +60,10 @@ const (
 	dhcpMsgInform   = 8
 )
 
-var dhcpMagicCookie = []byte{99, 130, 83, 99}
+var (
+	dhcpMagicCookie = []byte{99, 130, 83, 99}
+	broadcastAddr   = netip.MustParseAddr("255.255.255.255")
+)
 
 func dhcpMsgTypeName(t int) string {
 	switch t {
@@ -78,72 +89,46 @@ func dhcpMsgTypeName(t int) string {
 }
 
 type dhcpSock struct {
-	fd    int
+	conn  *net.UDPConn
 	iface *Interface
 	done  chan struct{}
 }
 
 func openDHCPSocket(iface *Interface, port int) (*dhcpSock, error) {
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
-	if err != nil {
-		Errorf("socket(AF_INET) for dhcpv4 relay on %s:%d: %v", iface.Ifname, port, err)
-		return nil, err
-	}
-
-	ok := false
-	defer func() {
-		if !ok {
-			closeFD(fd)
+	lc := net.ListenConfig{Control: func(_, _ string, conn syscall.RawConn) error {
+		var socketErr error
+		if err := conn.Control(func(fd uintptr) {
+			socketErr = configureDHCPSocket(int(fd), iface.Ifname)
+		}); err != nil {
+			return err
 		}
-	}()
-
-	if err := bindToDevice(fd, iface.Ifname); err != nil {
-		Errorf("SO_BINDTODEVICE(%s): %v", iface.Ifname, err)
-		return nil, err
-	}
-	if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-		Errorf("SO_REUSEADDR: %v", err)
-		return nil, err
-	}
-	if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-		Errorf("SO_REUSEPORT: %v", err)
-		return nil, err
-	}
-	if err := setsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1); err != nil {
-		Errorf("SO_BROADCAST: %v", err)
-		return nil, err
+		return socketErr
+	}}
+	conn, err := lc.ListenPacket(context.Background(), "udp4", ":"+strconv.Itoa(port))
+	if err != nil {
+		return nil, fmt.Errorf("DHCPv4 socket on %s:%d: %w", iface.Ifname, port, err)
 	}
 
-	if err := unix.Bind(fd, &unix.SockaddrInet4{Port: port}); err != nil {
-		Errorf("bind(:%d) on %s: %v", port, iface.Ifname, err)
-		return nil, err
-	}
-
-	ds := &dhcpSock{fd: fd, iface: iface, done: make(chan struct{})}
-	ok = true
+	ds := &dhcpSock{conn: conn.(*net.UDPConn), iface: iface, done: make(chan struct{})}
 	go dhcpReadLoop(ds)
 	return ds, nil
 }
 
-// dhcpv4Setup opens (or tears down) UDP sockets bound to the given
-// interface. Slave sockets receive client broadcasts (port 67); master sockets
-// receive server replies (port 67 for RFC 2131 unicast/broadcast, port 68 for
-// non-compliant upstream servers like ISP modems broadcasting replies to the client port).
-func dhcpv4Setup(iface *Interface, enable bool) error {
-	enable = enable && iface.DHCPv4 != ModeDisabled
-
-	if len(iface.dhcp) > 0 {
-		for _, ds := range iface.dhcp {
-			close(ds.done)
-			closeFD(ds.fd)
+func configureDHCPSocket(fd int, ifname string) error {
+	if err := unix.BindToDevice(fd, ifname); err != nil {
+		return err
+	}
+	for _, opt := range []int{unix.SO_REUSEADDR, unix.SO_REUSEPORT, unix.SO_BROADCAST} {
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, opt, 1); err != nil {
+			return err
 		}
-		iface.dhcp = nil
 	}
+	return nil
+}
 
-	if !enable {
-		return nil
-	}
-
+// The upstream also listens on port 68 for servers that broadcast replies to
+// the client port. Port 67 is the required socket for either role.
+func startDHCP(iface *Interface) error {
 	ds67, err := openDHCPSocket(iface, dhcpv4ServerPort)
 	if err != nil {
 		return err
@@ -151,32 +136,35 @@ func dhcpv4Setup(iface *Interface, enable bool) error {
 	iface.dhcp = append(iface.dhcp, ds67)
 
 	if iface.Master {
-		ds68, err := openDHCPSocket(iface, dhcpv4ClientPort)
-		if err != nil {
-			Warnf("Failed to bind port 68 on master %s (broadcast server replies may be missed): %v", iface.Ifname, err)
-		} else {
-			iface.dhcp = append(iface.dhcp, ds68)
-		}
+		startUpstreamClientPort(iface)
 	}
 
 	return nil
+}
+
+func startUpstreamClientPort(iface *Interface) {
+	ds, err := openDHCPSocket(iface, dhcpv4ClientPort)
+	if err != nil {
+		Warnf("Failed to bind port 68 on master %s (broadcast server replies may be missed): %v", iface.Ifname, err)
+		return
+	}
+	iface.dhcp = append(iface.dhcp, ds)
+}
+
+func stopDHCP(iface *Interface) {
+	for _, ds := range iface.dhcp {
+		close(ds.done)
+		_ = ds.conn.Close()
+	}
+	iface.dhcp = nil
 }
 
 func dhcpReadLoop(ds *dhcpSock) {
 	buf := make([]byte, 2048)
 
 	for {
-		select {
-		case <-ds.done:
-			return
-		default:
-		}
-
-		n, from, err := unix.Recvfrom(ds.fd, buf, 0)
+		n, src, err := ds.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			if err == unix.EINTR {
-				continue
-			}
 			select {
 			case <-ds.done:
 				return
@@ -189,15 +177,14 @@ func dhcpReadLoop(ds *dhcpSock) {
 			continue
 		}
 
-		var src netip.Addr
-		if sa4, ok := from.(*unix.SockaddrInet4); ok {
-			src = netip.AddrFrom4(sa4.Addr)
-		}
-
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		Eng.Post(func() { handleDHCPv4(ds, src, data) })
+		select {
+		case Eng.events <- func() { handleDHCPv4(ds, src, data) }:
+		case <-ds.done:
+			return
+		}
 	}
 }
 
@@ -214,7 +201,7 @@ func ifaceHasDHCPSock(iface *Interface, ds *dhcpSock) bool {
 // relayed when they arrive on a slave interface (a BOOTREQUEST seen on a
 // master is some other network's client - or our own relayed broadcast
 // looping back - and is never ours to relay), BOOTREPLYs only on masters.
-func handleDHCPv4(ds *dhcpSock, src netip.Addr, data []byte) {
+func handleDHCPv4(ds *dhcpSock, src netip.AddrPort, data []byte) {
 	iface := ds.iface
 	if !ifaceHasDHCPSock(iface, ds) || iface.DHCPv4 != ModeRelay {
 		return
@@ -232,12 +219,12 @@ func handleDHCPv4(ds *dhcpSock, src netip.Addr, data []byte) {
 
 	switch data[0] {
 	case bootpRequest:
-		if !iface.Master {
+		if !iface.Master && src.Port() == dhcpv4ClientPort {
 			relayClientRequest(data, iface)
 		}
 	case bootpReply:
-		if iface.Master {
-			relayServerResponse(src, data, iface)
+		if iface.Master && src.Port() == dhcpv4ServerPort && src.Addr().Unmap().IsGlobalUnicast() {
+			relayServerResponse(src.Addr().Unmap(), data, iface)
 		}
 	}
 }
@@ -346,9 +333,7 @@ func parseCircuitID(agentInfo []byte) (int, bool) {
 // insertAgentInfo returns a copy of the client packet with an RFC 3046
 // option 82 (circuit-id = the slave interface's ifindex) inserted just before
 // the End option, so a relayed reply can be routed back to the right slave.
-// If the packet already carries option 82 (another relay downstream of us)
-// the packet is relayed unmodified - the reply then falls back to being
-// broadcast on all slaves.
+// The caller validates any client-supplied Option 82 before insertion.
 func insertAgentInfo(data []byte, ifindex int) ([]byte, bool) {
 	off := dhcpOptionsOff
 	for {
@@ -439,42 +424,53 @@ func stripAgentInfo(data []byte) []byte {
 // address, per RFC 1542) is re-broadcast upstream, and the server unicasts
 // its reply back to that giaddr.
 func relayClientRequest(data []byte, iface *Interface) {
-	if data[3] >= dhcpMaxHops {
+	if data[3] >= dhcpMaxHops || !netip.AddrFrom4([4]byte(data[24:28])).IsUnspecified() {
 		return
 	}
 
 	opts := parseDHCPOptions(data)
-	msgType, _ := dhcpOptionByte(opts, dhcpOptMsgType)
+	msgType, ok := dhcpOptionByte(opts, dhcpOptMsgType)
+	if !ok {
+		return
+	}
+	for _, opt := range opts {
+		if opt.code == dhcpOptAgentInfo {
+			return // RFC 3046: clients on an untrusted link cannot supply Option 82.
+		}
+	}
 
 	Debugf("Got a DHCPv4-%s on %s", dhcpMsgTypeName(msgType), iface.Name)
 
-	// A client releasing/declining an address lets us drop the proxy-ARP
-	// mirror and the /32 host route immediately instead of waiting for the
-	// periodic sweep to notice the gone address.
+	client := dhcpClientFrom(data, opts)
+	ciaddr := netip.AddrFrom4([4]byte(data[12:16]))
+	address := dhcpOptionAddr(opts, dhcpOptRequested)
+	if ciaddr.IsGlobalUnicast() {
+		address = ciaddr
+	}
+	var relinquished netip.Addr
 	switch msgType {
+	case dhcpMsgDiscover, dhcpMsgRequest, dhcpMsgInform:
 	case dhcpMsgRelease:
-		if ci, ok := netip.AddrFromSlice(data[12:16]); ok && ci.Is4() && !ci.IsUnspecified() {
-			unmirrorClient(ci, iface)
-		}
+		relinquished = ciaddr
 	case dhcpMsgDecline:
-		for _, o := range opts {
-			if o.code == dhcpOptRequested && len(o.data) == 4 {
-				if a, ok := netip.AddrFromSlice(o.data); ok {
-					unmirrorClient(a, iface)
-				}
-			}
-		}
+		relinquished = dhcpOptionAddr(opts, dhcpOptRequested)
+	default:
+		return
+	}
+	if relinquished.IsValid() && !unmirrorClient(relinquished, iface, client) {
+		return
 	}
 
-	// Option 82 return routing is an optimization, not a prerequisite: if it
-	// cannot be inserted (packet too large to append it safely, malformed
-	// options area), relay the packet unmodified and let replies fall back to
-	// being broadcast on every slave - that beats not relaying at all.
+	// If there is no room for Option 82, transaction state still identifies
+	// the downstream interface when the reply comes back.
 	out82, have82 := insertAgentInfo(data, iface.Ifindex)
 	if !have82 {
 		Warnf("Cannot insert option 82 into DHCPv4 packet on %s, relaying without it", iface.Name)
+		out82 = data
 	}
 
+	now := time.Now()
+	expectReply := msgType == dhcpMsgDiscover || msgType == dhcpMsgRequest || msgType == dhcpMsgInform
 	for _, c := range interfaces {
 		if !c.Master || c.DHCPv4 != ModeRelay || len(c.dhcp) == 0 {
 			continue
@@ -486,17 +482,15 @@ func relayClientRequest(data []byte, iface *Interface) {
 			continue
 		}
 
-		out := out82
-		if !have82 {
-			out = data
+		key := dhcpTransactionFor(data, c)
+		if expectReply && !canTrackDHCP(key, iface, now) {
+			continue
 		}
 
 		// Per-master copy: hops and giaddr are ours to set.
-		out = append([]byte(nil), out...)
+		out := append([]byte(nil), out82...)
 		out[3]++ // hops
-		if bytes.Equal(out[24:28], []byte{0, 0, 0, 0}) {
-			copy(out[24:28], giaddr.AsSlice()) // giaddr
-		}
+		copy(out[24:28], giaddr.AsSlice())
 		// Force the broadcast flag on the relayed copy. Some servers (ISP
 		// modems observed in the field) silently drop relayed requests with
 		// the flag clear: instead of returning the reply via giaddr they try
@@ -509,51 +503,63 @@ func relayClientRequest(data []byte, iface *Interface) {
 		out[10] |= byte(bootpBroadcastFlag >> 8)
 
 		Debugf("Relaying DHCPv4-%s (giaddr %s) to broadcast on %s", dhcpMsgTypeName(msgType), giaddr, c.Name)
-		sendDHCPv4(c, broadcastAddr, dhcpv4ServerPort, out)
+		if sendDHCPv4(c, broadcastAddr, dhcpv4ServerPort, out) && expectReply {
+			dhcpRequests[key] = pendingDHCP{
+				slave: iface, client: client, kind: msgType, giaddr: giaddr,
+				server: dhcpOptionAddr(opts, dhcpOptServerID), address: address,
+				expires: now.Add(dhcpRequestLifetime),
+			}
+		}
 	}
 }
 
-// rewriteGateway patches the router option (DHCP option 3) of a server reply
-// in place, so clients behind the receiving slave interface use the relay's
-// own address on that slave as their default gateway instead of the upstream
-// router's. The data path is unchanged either way - the relay answers ARP for
-// its own address on the slave, and upstream next-hops stay reachable through
-// it via proxy-ARP; this only changes which address clients display and use
-// as their gateway. Option 3 is always 4 bytes, so this is an in-place patch
-// on the per-target payload copy stripAgentInfo produced. Returns false when
-// there is nothing to rewrite (no option 3, or an unexpected length).
+// rewriteGateway changes the preferred router only when the lease makes it
+// reachable on-link. Preserve the server's options when classless routes
+// take precedence or the client subnet cannot be established.
 func rewriteGateway(data []byte, gw netip.Addr) bool {
-	off := dhcpOptionsOff
-	for {
-		if off >= len(data) {
-			return false
-		}
-		code := data[off]
-		if code == dhcpOptEnd {
-			return false
-		}
-		if code == dhcpOptPad {
-			off++
-			continue
-		}
-		if off+2 > len(data) {
-			return false
-		}
-		l := int(data[off+1])
-		if code == dhcpOptRouter {
-			if l != 4 || off+2+l > len(data) {
-				return false
-			}
-			copy(data[off+2:off+2+4], gw.AsSlice())
-			return true
-		}
-		off += 2 + l
+	if len(data) < dhcpOptionsOff || !gw.Is4() || !gw.IsGlobalUnicast() {
+		return false
 	}
+	client := netip.AddrFrom4([4]byte(data[16:20]))
+	if client.IsUnspecified() {
+		client = netip.AddrFrom4([4]byte(data[12:16]))
+	}
+	if !client.IsGlobalUnicast() || client == gw {
+		return false
+	}
+	var mask, routers []byte
+	for _, opt := range parseDHCPOptions(data) {
+		switch opt.code {
+		case dhcpOptRoutes:
+			return false
+		case dhcpOptMask:
+			mask = opt.data
+		case dhcpOptRouter:
+			if routers == nil {
+				routers = opt.data
+			}
+		}
+	}
+	ones, bits := net.IPMask(mask).Size()
+	if bits != 32 || ones == 0 || len(routers) < 4 || len(routers)%4 != 0 {
+		return false
+	}
+	prefix := netip.PrefixFrom(client, ones).Masked()
+	if !prefix.Contains(gw) {
+		return false
+	}
+	if ones < 31 {
+		broadcast := binary.BigEndian.Uint32(prefix.Addr().AsSlice()) | ^binary.BigEndian.Uint32(mask)
+		if gw == prefix.Addr() || binary.BigEndian.Uint32(gw.AsSlice()) == broadcast {
+			return false
+		}
+	}
+	copy(routers[:4], gw.AsSlice())
+	return true
 }
 
 // relayServerResponse relays a server BOOTREPLY received on a master
-// interface to the slave the circuit-id option names (falling back to all
-// slaves when the server did not echo option 82). OFFER/NAK are always
+// interface to the slave recorded when the request was sent. OFFER/NAK are
 // broadcast on the slave; an ACK additionally seeds the client's ARP entry
 // and installs the proxy-ARP mirror + /32 host route before the packet is
 // delivered, so the address is fully reachable the moment the client
@@ -564,96 +570,80 @@ func relayServerResponse(src netip.Addr, data []byte, master *Interface) {
 		return
 	}
 
-	msgType, _ := dhcpOptionByte(opts, dhcpOptMsgType)
+	msgType, ok := dhcpOptionByte(opts, dhcpOptMsgType)
+	if !ok {
+		return
+	}
+	key := dhcpTransactionFor(data, master)
+	request, ok := matchDHCPReply(key, data, opts, msgType, time.Now())
+	if !ok {
+		return
+	}
 
 	Debugf("Got a DHCPv4-%s from %s on %s", dhcpMsgTypeName(msgType), src, master.Name)
 
-	var (
-		slave     *Interface
-		haveSlave bool
-	)
-	for _, o := range opts {
-		if o.code == dhcpOptAgentInfo {
-			if idx, ok := parseCircuitID(o.data); ok {
-				if i := ifaceByIndex(idx); i != nil && !i.Master {
-					slave, haveSlave = i, true
-				}
-			}
-		}
+	slave := request.slave
+	payload := stripAgentInfo(data)
+	if gw, ok := relayLinkAddress4(slave); ok && rewriteGateway(payload, gw) {
+		Debugf("DHCPv4-%s gateway rewritten to %s on %s", dhcpMsgTypeName(msgType), gw, slave.Name)
 	}
 
-	targets := make([]*Interface, 0, 1)
-	if haveSlave {
-		targets = append(targets, slave)
-	} else {
-		for _, i := range interfaces {
-			if !i.Master && i.DHCPv4 == ModeRelay && len(i.dhcp) > 0 {
-				targets = append(targets, i)
-			}
+	yiaddr := netip.AddrFrom4([4]byte(data[16:20]))
+	dest := broadcastAddr
+	if msgType == dhcpMsgAck && request.kind == dhcpMsgRequest && yiaddr.IsGlobalUnicast() {
+		mac := net.HardwareAddr(request.client.mac[:])
+		Infof("DHCPv4-ack: %s assigned to %s on %s", yiaddr, mac, slave.Name)
+		neighbor := mirroredNeighKey{addr: yiaddr, ifindex: slave.Ifindex}
+		if !mirroredNeighs[neighbor] {
+			mirroredNeighs[neighbor] = true
+			arpMirrorAddr(yiaddr, slave, true)
+		}
+		dhcpLeases[neighbor] = request.client
+		seedNeighbor4(yiaddr, mac, slave.Ifindex)
+		if binary.BigEndian.Uint16(data[10:12])&bootpBroadcastFlag == 0 {
+			dest = yiaddr
 		}
 	}
-
-	yiaddr, hasYi := netip.AddrFromSlice(data[16:20])
-	if hasYi && (!yiaddr.Is4() || yiaddr.IsUnspecified() || yiaddr.IsMulticast() || yiaddr.IsLoopback() || yiaddr.IsLinkLocalUnicast()) {
-		hasYi = false
-	}
-	flags := binary.BigEndian.Uint16(data[10:12])
-
-	for _, t := range targets {
-		// Per-target copy: option 82 is stripped, and each slave's clients
-		// get that slave's own address as their gateway (when it has one).
-		payload := stripAgentInfo(data)
-		if gw, ok := relayLinkAddress4(t); ok {
-			if rewriteGateway(payload, gw) {
-				Debugf("DHCPv4-%s gateway rewritten to %s on %s", dhcpMsgTypeName(msgType), gw, t.Name)
+	Debugf("Sending DHCPv4-%s to %s on %s", dhcpMsgTypeName(msgType), dest, slave.Name)
+	if sendDHCPv4(slave, dest, dhcpv4ClientPort, payload) && msgType != dhcpMsgOffer {
+		for _, upstream := range interfaces {
+			key.master = upstream
+			if other := dhcpRequests[key]; other.slave == slave {
+				delete(dhcpRequests, key)
 			}
 		}
-
-		if msgType == dhcpMsgAck && hasYi {
-			var mac [6]byte
-			copy(mac[:], data[28:34])
-			Infof("DHCPv4-ack: %s assigned to %02x:%02x:%02x:%02x:%02x:%02x on %s",
-				yiaddr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], t.Name)
-			key := mirroredNeighKey{addr: yiaddr, ifindex: t.Ifindex}
-			if !mirroredNeighs[key] {
-				mirroredNeighs[key] = true
-				arpMirrorAddr(yiaddr, t, true)
-			}
-			seedNeighbor4(yiaddr, net.HardwareAddr(mac[:]), t.Ifindex)
-		}
-
-		dest := broadcastAddr
-		if flags&bootpBroadcastFlag == 0 && msgType == dhcpMsgAck && hasYi {
-			dest = yiaddr // unicast delivery, ARP entry seeded above
-		}
-		Debugf("Sending DHCPv4-%s to %s on %s", dhcpMsgTypeName(msgType), dest, t.Name)
-		sendDHCPv4(t, dest, dhcpv4ClientPort, payload)
 	}
 }
 
-// unmirrorClient tears down the proxy-ARP mirror, host route and ARP cache
-// entry for an address a client just gave up. Only touches state that is
-// actually mirrored, so it is safe to call for any address.
-func unmirrorClient(addr netip.Addr, iface *Interface) {
+// unmirrorClient accepts a release only from the recorded owner. Unknown
+// leases can be forwarded upstream without deleting any local state.
+func unmirrorClient(addr netip.Addr, iface *Interface, client dhcpClient) bool {
 	key := mirroredNeighKey{addr: addr, ifindex: iface.Ifindex}
-	if !mirroredNeighs[key] {
-		return
+	owner, ok := dhcpLeases[key]
+	if !ok {
+		return true
 	}
+	if owner != client {
+		return false
+	}
+	delete(dhcpLeases, key)
 	delete(mirroredNeighs, key)
 	Infof("Client on %s gave up %s, removing mirror", iface.Name, addr)
 	arpMirrorAddr(addr, iface, false)
 	deleteNeigh4(addr, iface.Ifindex)
+	return true
 }
 
 // sendDHCPv4 sends payload out iface's DHCPv4 socket toward dest:port.
-func sendDHCPv4(iface *Interface, dest netip.Addr, port int, payload []byte) {
+func sendDHCPv4(iface *Interface, dest netip.Addr, port int, payload []byte) bool {
 	if len(iface.dhcp) == 0 {
-		return
+		return false
 	}
 
-	if err := unix.Sendto(iface.dhcp[0].fd, payload, 0, sockaddrIn4(dest, port)); err != nil {
+	if _, err := iface.dhcp[0].conn.WriteToUDPAddrPort(payload, netip.AddrPortFrom(dest, uint16(port))); err != nil {
 		Errorf("Failed to send DHCPv4 to %s@%s: %v", dest, iface.Ifname, err)
-	} else {
-		Debugf("Sent %d bytes DHCPv4 to %s:%d@%s", len(payload), dest, port, iface.Ifname)
+		return false
 	}
+	Debugf("Sent %d bytes DHCPv4 to %s:%d@%s", len(payload), dest, port, iface.Ifname)
+	return true
 }

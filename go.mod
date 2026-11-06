@@ -2,6 +2,8 @@ module github.com/r2xpdhrlcmluzybjyw5hcnk/ipv4-relay
 
 go 1.25.0
 
+toolchain go1.27.3
+
 require (
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sys v0.47.0

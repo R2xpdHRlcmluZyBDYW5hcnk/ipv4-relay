@@ -141,17 +141,17 @@ var staleClientSweepInterval = 300 * time.Second
 // startMirrorSweep arranges for sweepFailedAndOrphans to run every
 // staleClientSweepInterval until done is closed.
 func startMirrorSweep(done <-chan struct{}) {
-	var tick func()
-	tick = func() {
-		select {
-		case <-done:
-			return
-		default:
-		}
-		Eng.Post(sweepFailedAndOrphans)
-		time.AfterFunc(staleClientSweepInterval, tick)
-	}
-	time.AfterFunc(staleClientSweepInterval, tick)
+	time.AfterFunc(staleClientSweepInterval, func() {
+		Eng.Post(func() {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			sweepFailedAndOrphans()
+			startMirrorSweep(done)
+		})
+	})
 }
 
 // sweepFailedAndOrphans is the periodic backstop counterpart to
@@ -204,6 +204,7 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 
 		if n.State&unix.NUD_FAILED != 0 {
 			key := mirroredNeighKey{addr: addr, ifindex: iface.Ifindex}
+			delete(dhcpLeases, key)
 			if mirroredNeighs[key] {
 				delete(mirroredNeighs, key)
 				arpMirrorAddr(addr, iface, false)
@@ -236,14 +237,7 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 	}
 
 	for _, r := range routes {
-		if r.LinkIndex != iface.Ifindex || r.Priority != ourRouteMetric || r.Dst == nil {
-			continue
-		}
-		if ones, bits := r.Dst.Mask.Size(); bits != 32 || ones != 32 {
-			continue
-		}
-
-		addr, ok := netip.AddrFromSlice(r.Dst.IP.To4())
+		addr, ok := relayRouteAddress(r, iface.Ifindex)
 		if !ok {
 			continue
 		}
@@ -252,7 +246,9 @@ func sweepIfaceFailedAndOrphans(iface *Interface) {
 			continue
 		}
 
-		delete(mirroredNeighs, mirroredNeighKey{addr: addr, ifindex: iface.Ifindex})
+		key := mirroredNeighKey{addr: addr, ifindex: iface.Ifindex}
+		delete(mirroredNeighs, key)
+		delete(dhcpLeases, key)
 		Infof("Removing orphaned host route/proxy-ARP entry %s on %s (no matching neighbor left)", addr, iface.Ifname)
 		arpMirrorAddr(addr, iface, false)
 	}
@@ -275,11 +271,11 @@ var reconcileScheduled bool
 // signal, so a single (debounced) reconcile off it restores proxy_arp, the
 // proxy-ARP entries and the host routes together. Runs on the Engine goroutine.
 func handleRouteEvent(u netlink.RouteUpdate) {
-	if u.Type != unix.RTM_DELROUTE || u.Priority != ourRouteMetric || u.Dst == nil {
+	if u.Type != unix.RTM_DELROUTE {
 		return
 	}
-	if ones, bits := u.Dst.Mask.Size(); bits != 32 || ones != 32 {
-		return // only our /32 host routes
+	if _, ok := relayRouteAddress(u.Route, u.LinkIndex); !ok {
+		return
 	}
 	if iface := ifaceByIndex(u.LinkIndex); iface == nil || iface.ARP != ModeRelay {
 		return
@@ -311,21 +307,19 @@ func scheduleReconcile() {
 // goroutine.
 func reconcileKernelState() {
 	for _, iface := range interfaces {
-		if iface.ARP != ModeRelay {
-			continue
-		}
-		if err := setProxyARP(iface.Ifname, true); err != nil {
-			Debugf("reconcile proxy_arp on %s: %v", iface.Ifname, err)
+		if iface.Running && iface.ARP == ModeRelay {
+			setInterfaceARP(iface, true)
 		}
 	}
+	reconcileMirrors()
+}
 
-	// Re-assert the mirror for every downstream host we have learned.
+func reconcileMirrors() {
 	for key := range mirroredNeighs {
 		iface := ifaceByIndex(key.ifindex)
-		if iface == nil {
-			continue
+		if iface != nil && iface.Running && iface.ARP == ModeRelay {
+			arpMirrorAddr(key.addr, iface, true)
 		}
-		arpMirrorAddr(key.addr, iface, true)
 	}
 }
 
@@ -363,6 +357,9 @@ func handleLinkEvent(u netlink.LinkUpdate) {
 				refreshInterfaceAddresses(iface)
 			}
 			reloadServices(iface)
+			if nowRunning {
+				reconcileMirrors()
+			}
 		}
 		return
 	}
@@ -376,6 +373,9 @@ func handleLinkEvent(u netlink.LinkUpdate) {
 	iface.Running = nowRunning
 	refreshInterfaceAddresses(iface)
 	reloadServices(iface)
+	if nowRunning {
+		reconcileMirrors()
+	}
 }
 
 // handleAddrEvent refreshes the cached address list for the interface. The
@@ -396,12 +396,31 @@ func handleAddrEvent(u netlink.AddrUpdate) {
 }
 
 func clearMirroredState(iface *Interface) {
+	if iface.Ifindex == 0 {
+		return
+	}
 	for key := range mirroredNeighs {
 		if key.ifindex != iface.Ifindex {
+			if iface.Master && iface.ARP == ModeRelay {
+				if err := setupProxyNeigh4(key.addr, iface.Ifindex, false); err != nil {
+					Warnf("proxy arp %s on %s: %v", key.addr, iface.Ifname, err)
+				}
+			}
 			continue
 		}
 		arpMirrorAddr(key.addr, iface, false)
+		if _, ok := dhcpLeases[key]; ok {
+			deleteNeigh4(key.addr, iface.Ifindex)
+			delete(dhcpLeases, key)
+		}
 		delete(mirroredNeighs, key)
+	}
+	// Routes can outlive the daemon that created them. Remove remaining
+	// mirrors on a retiring interface even before any new neighbor events.
+	if iface.LearnRoutes {
+		for _, addr := range interfaceRouteAddresses(iface) {
+			arpMirrorAddr(addr, iface, false)
+		}
 	}
 }
 
@@ -416,7 +435,7 @@ func clearMirroredState(iface *Interface) {
 // unconditionally, not just when it was mirrored: left alone, failed ARP
 // entries otherwise linger in `ip neigh show`.
 func handleNeighEvent(u netlink.NeighUpdate) {
-	if u.Type != unix.RTM_NEWNEIGH {
+	if u.Type != unix.RTM_NEWNEIGH || u.Flags&unix.NTF_PROXY != 0 {
 		return
 	}
 
@@ -447,6 +466,7 @@ func handleNeighEvent(u netlink.NeighUpdate) {
 		mirroredNeighs[key] = true
 		arpMirrorAddr(addr, iface, true)
 	} else if failed {
+		delete(dhcpLeases, key)
 		if mirrored {
 			delete(mirroredNeighs, key)
 			arpMirrorAddr(addr, iface, false)

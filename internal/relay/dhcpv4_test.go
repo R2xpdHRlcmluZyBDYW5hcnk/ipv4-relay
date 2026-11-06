@@ -199,42 +199,62 @@ func TestStripAgentInfo(t *testing.T) {
 }
 
 func TestRewriteGateway(t *testing.T) {
-	gw := netip.MustParseAddr("192.168.8.1")
+	mask := optBytes(dhcpOptMask, 255, 255, 255, 0)
+	router := optBytes(dhcpOptRouter, 192, 0, 2, 254)
+	gw := netip.MustParseAddr("192.0.2.1")
+	classless := optBytes(dhcpOptRoutes, 0, 192, 0, 2, 254)
+	for _, tc := range []struct {
+		name    string
+		lease   string
+		gateway netip.Addr
+		options [][]byte
+		changed bool
+	}{
+		{"same subnet", "192.0.2.42", gw, [][]byte{mask, router}, true},
+		{"two routers", "192.0.2.42", gw, [][]byte{mask, optBytes(dhcpOptRouter, 192, 0, 2, 254, 192, 0, 2, 253)}, true},
+		{"different subnet", "198.51.100.42", gw, [][]byte{mask, router}, false},
+		{"own address", "192.0.2.1", gw, [][]byte{mask, router}, false},
+		{"broadcast", "192.0.2.42", netip.MustParseAddr("192.0.2.255"), [][]byte{mask, router}, false},
+		{"classless routes", "192.0.2.42", gw, [][]byte{mask, router, classless}, false},
+		{"no mask", "192.0.2.42", gw, [][]byte{router}, false},
+		{"invalid mask", "192.0.2.42", gw, [][]byte{optBytes(dhcpOptMask, 255, 0, 255, 0), router}, false},
+		{"no router", "192.0.2.42", gw, [][]byte{mask}, false},
+		{"invalid router", "192.0.2.42", gw, [][]byte{mask, optBytes(dhcpOptRouter, 192, 0, 2)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pkt := buildDHCP(append([][]byte{optBytes(dhcpOptMsgType, dhcpMsgAck)}, tc.options...)...)
+			copy(pkt[16:20], netip.MustParseAddr(tc.lease).AsSlice())
+			original := bytes.Clone(pkt)
+			if got := rewriteGateway(pkt, tc.gateway); got != tc.changed {
+				t.Fatalf("rewriteGateway = %v, want %v", got, tc.changed)
+			}
+			if tc.changed {
+				routers, _ := findOpt(parseDHCPOptions(original), dhcpOptRouter)
+				copy(routers[:4], gw.AsSlice())
+			}
+			if !bytes.Equal(pkt, original) {
+				t.Fatalf("unexpected packet changes: got %x, want %x", pkt[dhcpOptionsOff:], original[dhcpOptionsOff:])
+			}
+		})
+	}
+}
 
-	// Normal ACK carrying option 3: patched in place, siblings untouched.
-	pkt := buildDHCP(
-		optBytes(dhcpOptMsgType, dhcpMsgAck),
-		optBytes(dhcpOptRouter, 192, 168, 1, 1),
-		optBytes(dhcpOptRequested, 10, 0, 0, 5),
-	)
+func TestRewriteGatewayWithOverloadedOptions(t *testing.T) {
+	pkt := buildDHCP(optBytes(dhcpOptMask, 255, 255, 255, 0), optBytes(dhcpOptOverload, 1))
+	copy(pkt[16:20], netip.MustParseAddr("192.0.2.42").AsSlice())
+	router := optBytes(dhcpOptRouter, 192, 0, 2, 254)
+	headerField(pkt, bootpFileOff, append(router, dhcpOptEnd)...)
+	gw := netip.MustParseAddr("192.0.2.1")
 	if !rewriteGateway(pkt, gw) {
-		t.Fatal("rewrite failed on packet with option 3")
+		t.Fatal("overloaded router option was not rewritten")
 	}
-	off := bytes.Index(pkt, []byte{dhcpOptRouter, 4})
-	if off < 0 {
-		t.Fatal("option 3 vanished")
+	if got, _ := findOpt(parseDHCPOptions(pkt), dhcpOptRouter); !bytes.Equal(got, gw.AsSlice()) {
+		t.Fatalf("overloaded router = %v, want %v", got, gw)
 	}
-	if !bytes.Equal(pkt[off+2:off+6], gw.AsSlice()) {
-		t.Fatalf("gateway not rewritten: %v", pkt[off+2:off+6])
-	}
-	opts := parseDHCPOptions(pkt)
-	if d, ok := findOpt(opts, dhcpOptRouter); !ok || !bytes.Equal(d, gw.AsSlice()) {
-		t.Fatalf("option 3 wrong after rewrite: %v", d)
-	}
-	if mt, ok := findOpt(opts, dhcpOptMsgType); !ok || mt[0] != dhcpMsgAck {
-		t.Fatal("sibling option corrupted by rewrite")
-	}
-
-	// No option 3: nothing to do.
-	plain := buildDHCP(optBytes(dhcpOptMsgType, dhcpMsgNak))
-	if rewriteGateway(plain, gw) {
-		t.Fatal("rewrite must fail without option 3")
-	}
-
-	// Option 3 with an unexpected length: refuse to patch.
-	odd := buildDHCP([]byte{dhcpOptRouter, 3})
-	if rewriteGateway(odd, gw) {
-		t.Fatal("rewrite must refuse odd-length option 3")
+	overloaded := append(router, optBytes(dhcpOptRoutes, 0, 192, 0, 2, 254)...)
+	headerField(pkt, bootpFileOff, append(overloaded, dhcpOptEnd)...)
+	if rewriteGateway(pkt, gw) {
+		t.Fatal("overloaded Option 121 should take precedence")
 	}
 }
 
