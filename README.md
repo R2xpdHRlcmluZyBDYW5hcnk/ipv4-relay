@@ -2,7 +2,7 @@
 
 轻量级 IPv4 中继守护进程（DHCPv4 / ARP relay），Go 语言实现，单文件静态编译，无外部依赖。
 
-适用于将下游（LAN）网段「透明桥接」到上游（WAN）广播域的场景：下游客户端发出的 DHCPv4 请求经中继打上 Option 82 后在上游广播，上游 DHCP 服务器直接给客户端分配上游网段的地址，配合 proxy-ARP 与主机路由实现双向可达。即插即用——不需要指定 DHCP 服务器地址，因为 DHCPv4 本身就是广播协议。
+下游（LAN）客户端通过中继从上游（WAN）DHCP 服务器获取 IPv4 地址。中继在上游接口广播请求，无需配置服务器地址，并通过 proxy ARP 和主机路由实现双向连通。
 
 ## 功能
 
@@ -10,7 +10,7 @@
   - 下游接口接收客户端 DHCP 广播 -> 填 `giaddr` + 附加 Option 82 circuit-id -> 上游接口重新广播
   - 上游应答按已转发的 DHCP 请求匹配，只发回原下游接口。服务器不回显 Option 82 时也能定位，回显时校验 circuit-id 并剥除该选项
   - 从匹配的 DHCPACK 学习客户端，安装 proxy-ARP 表项和 `/32` 主机路由。收到已记录的租约持有者的 RELEASE/DECLINE 时清理
-  - 邻居表事件 + 周期清扫兜底，客户端消失后自动回收表项
+  - 通过邻居表事件和定期清理回收失效表项
   - 网关改写：下游接口地址按应答中的子网掩码可在客户端链路上直达时，将 Option 3 的首选网关改为该地址。缺少可用掩码或上游提供 Option 121 时保留服务器的网关和路由选项
 - **ARP 中继（proxy ARP）**
   - 上游对客户端地址的 ARP 询问由本机代答，下游对上游地址的 ARP 询问同样代答
@@ -57,10 +57,17 @@ ipv4-relay -c /etc/ipv4-relay/config.json [-l 0..7] [-f]
 
 ### systemd
 
+首次手动安装时，复制二进制、服务单元和示例配置。
+
 ```sh
 install -m 755 ipv4-relay /usr/sbin/
 install -m 644 ipv4-relay.service /usr/lib/systemd/system/
-install -m 644 config.json.example /etc/ipv4-relay/config.json  # 按需修改
+install -Dm 644 config.json.example /etc/ipv4-relay/config.json
+```
+
+将 `/etc/ipv4-relay/config.json` 中的 `interfaces.lan.ifname` 和 `interfaces.wan.ifname` 分别设为实际的下游和上游网卡名，再启动服务。
+
+```sh
 systemctl enable --now ipv4-relay
 ```
 
