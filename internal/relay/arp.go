@@ -12,21 +12,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// setProxyARP toggles net.ipv4.conf.<ifname>.proxy_arp. The kernel only
-// answers ARP requests for our NTF_PROXY entries (and for addresses routed
-// via a different interface) while proxy_arp is enabled, so this must stay
-// enabled for the whole lifetime of the relay - see reconcileKernelState()
-// for why it is periodically re-asserted.
-//
-// The sysctl is read before writing so a re-assert that finds the value
-// already correct (the common case on a debounced reconcile) is a pure read
-// with no write - it never touches the value unless it actually differs.
-func setProxyARP(ifname string, enable bool) error {
-	path := "/proc/sys/net/ipv4/conf/" + ifname + "/proxy_arp"
-	want := byte('0')
-	if enable {
-		want = '1'
-	}
+// Skip writes when re-applying settings that already match.
+func setARPSysctl(path string, want byte) error {
 	if cur, err := os.ReadFile(path); err == nil {
 		if c := bytes.TrimSpace(cur); len(c) == 1 && c[0] == want {
 			return nil
@@ -35,7 +22,7 @@ func setProxyARP(ifname string, enable bool) error {
 	return os.WriteFile(path, []byte{want, '\n'}, 0)
 }
 
-// arpSetup toggles the proxy_arp sysctl for the given interface. Unlike the
+// arpSetup configures kernel proxy ARP for the given interface. Unlike the
 // IPv6 side (which needs AF_PACKET capture sockets for NS relay), IPv4 proxy
 // ARP is answered entirely by the kernel:
 //   - on slave interfaces the "routed via a different interface" rule makes
@@ -45,8 +32,17 @@ func setProxyARP(ifname string, enable bool) error {
 //     client (see arpMirrorAddr) make the box answer upstream ARP requests
 //     for relayed client addresses with the master's own MAC.
 func arpSetup(iface *Interface, enable bool) error {
-	enable = enable && iface.ARP != ModeDisabled
-	return setProxyARP(iface.Ifname, enable)
+	want := byte('0')
+	var delayErr error
+	if enable && iface.ARP == ModeRelay {
+		want = '1'
+		if iface.Master {
+			// Reply before an upstream DHCP server finishes checking
+			// whether a downstream address is already in use.
+			delayErr = setARPSysctl("/proc/sys/net/ipv4/neigh/"+iface.Ifname+"/proxy_delay", '0')
+		}
+	}
+	return errors.Join(delayErr, setARPSysctl("/proc/sys/net/ipv4/conf/"+iface.Ifname+"/proxy_arp", want))
 }
 
 // arpMirrorAddr installs (or removes) a proxy-ARP entry on every other master
@@ -59,13 +55,11 @@ func arpMirrorAddr(addr netip.Addr, iface *Interface, add bool) {
 		if c.Ifindex == 0 || c.Ifindex == iface.Ifindex || !c.Master || c.ARP != ModeRelay || (add && !c.Running) {
 			continue
 		}
-		// A proxy-ARP entry is inert unless proxy_arp is enabled on its
-		// interface, so re-assert it here: this keeps proxy_arp correct even
-		// after an external reset (e.g. `netplan apply`) for which no host
-		// route existed to trigger handleRouteEvent.
+		// Re-apply upstream ARP settings when an external reset had
+		// no host route to remove and trigger handleRouteEvent.
 		if add {
-			if err := setProxyARP(c.Ifname, true); err != nil {
-				Debugf("proxy_arp on %s: %v", c.Ifname, err)
+			if err := arpSetup(c, true); err != nil {
+				Debugf("configure proxy ARP on %s: %v", c.Ifname, err)
 			}
 		}
 		if err := setupProxyNeigh4(addr, c.Ifindex, add); err != nil {

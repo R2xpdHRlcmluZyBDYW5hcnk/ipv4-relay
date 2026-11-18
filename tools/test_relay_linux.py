@@ -17,6 +17,8 @@ OTHER = bytes.fromhex("020011223344")
 SERVER = "192.0.2.2"
 UPSTREAM_ROUTER = "192.0.2.254"
 BROADCAST = "255.255.255.255"
+WAN_PROXY_DELAY = Path("/proc/sys/net/ipv4/neigh/wan0/proxy_delay")
+LAN_PROXY_DELAY = Path("/proc/sys/net/ipv4/neigh/lana/proxy_delay")
 
 
 def ip(*args):
@@ -115,6 +117,8 @@ def socket_handles(proc):
 
 def run(command):
     make_links()
+    WAN_PROXY_DELAY.write_text("80\n")
+    LAN_PROXY_DELAY.write_text("80\n")
     config = {"global": {"log_level": 7, "stale_client_sweep_interval_seconds": 60}, "interfaces": {
         "up": {"ifname": "wan0", "master": True},
         "a": {"ifname": "lana"},
@@ -129,6 +133,9 @@ def run(command):
             proc = subprocess.Popen([*command, "-f", "-c", str(path)], stdout=output, stderr=output)
             try:
                 wait_for(lambda: "Log level set to 7" in log.read_text(), "relay failed to start")
+                assert WAN_PROXY_DELAY.read_text().strip() == "0"
+                assert LAN_PROXY_DELAY.read_text().strip() == "80"
+                print("PASS startup sets the upstream IPv4 proxy delay to zero")
                 exercise(proc, path, log, config)
             except Exception:
                 print(log.read_text(), file=sys.stderr)
@@ -190,11 +197,13 @@ def exercise(proc, path, log, config):
         assert not host_route(addr) and not proxy_neighbor(addr)
         print("PASS unsolicited and mismatched ACKs do not reach clients or change kernel state")
 
+        WAN_PROXY_DELAY.write_text("80\n")
         ack(server, 2, addr, dest_port=68)
         assert router in receive(client_a, 2)[240:]
         expect_silence(client_b)
         assert [r["dev"] for r in host_route(addr)] == ["lana"]
         assert proxy_neighbor(addr)
+        assert WAN_PROXY_DELAY.read_text().strip() == "0"
         assert not ip("neigh", "show", "to", addr, "dev", "lanb")
         print("PASS ACK without Option 82 reaches only the originating LAN and retains an on-link gateway")
 
@@ -213,9 +222,13 @@ def exercise(proc, path, log, config):
         print("PASS on-link LAN gateway is rewritten")
 
         initial_handles = socket_handles(proc)
+        WAN_PROXY_DELAY.write_text("80\n")
         for _ in range(3):
             reload_config(config)
             assert socket_handles(proc) == initial_handles, "no-op reload replaced listeners"
+            assert WAN_PROXY_DELAY.read_text().strip() == "0"
+            assert LAN_PROXY_DELAY.read_text().strip() == "80"
+        print("PASS reload restores the upstream IPv4 proxy delay")
 
         reload_config("{", success=False)
         assert socket_handles(proc) == initial_handles

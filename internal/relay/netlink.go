@@ -299,7 +299,7 @@ func scheduleReconcile() {
 	})
 }
 
-// reconcileKernelState re-applies the proxy_arp sysctl, proxy-ARP neighbor
+// reconcileKernelState re-applies the ARP sysctls, proxy-ARP neighbor
 // entries and host routes the daemon is responsible for. Every underlying
 // operation (sysctl write, NeighSet, RouteReplace) is idempotent, so on the
 // steady-state happy path this is a cheap no-op; it only actually changes

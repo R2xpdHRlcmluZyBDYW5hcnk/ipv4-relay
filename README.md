@@ -14,6 +14,7 @@ Downstream (LAN) clients obtain IPv4 addresses from an upstream (WAN) DHCP serve
   - Rewrites the preferred gateway in Option 3 to the downstream interface address when that address is directly reachable on the client's link according to the subnet mask in the reply. Preserves the server's gateway and route options if no usable mask is available or the upstream server supplies Option 121.
 - **ARP relay (proxy ARP)**
   - Answers upstream ARP requests for client addresses and downstream ARP requests for upstream addresses on their behalf.
+  - Sets IPv4 `proxy_delay=0` on active upstream interfaces so their ARP replies can reach the DHCP server before its address checks finish.
 - **Hot reload**: `SIGHUP` reloads the configuration. If reading or validating the configuration, or binding a required DHCP port, fails, the relay keeps the active configuration and logs the error. Interface additions, removals, and address changes are tracked automatically through netlink.
 - **Non-root operation**: Uses systemd `DynamicUser` and `AmbientCapabilities`, requiring only `CAP_NET_RAW`, `CAP_NET_ADMIN`, and `CAP_NET_BIND_SERVICE`.
 

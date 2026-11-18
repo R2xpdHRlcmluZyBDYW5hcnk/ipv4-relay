@@ -161,7 +161,7 @@ func sameRelayInterface(old, next *Interface) bool {
 func setInterfaceARP(iface *Interface, enable bool) {
 	if iface.Ifindex != 0 {
 		if err := arpSetup(iface, enable); err != nil {
-			Warnf("proxy_arp on %s: %v", iface.Ifname, err)
+			Warnf("configure proxy ARP on %s: %v", iface.Ifname, err)
 		}
 	}
 }

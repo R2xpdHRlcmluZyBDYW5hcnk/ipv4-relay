@@ -23,7 +23,7 @@ func ipv4Enabled() bool {
 	return true
 }
 
-const version = "v0.1.3"
+const version = "v0.1.4"
 
 func printUsage(app string, exitCode int) {
 	fmt.Fprintf(os.Stderr, "== %s Usage ==\n"+
